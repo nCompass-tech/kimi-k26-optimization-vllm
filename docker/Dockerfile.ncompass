@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1.7
+#
+# Standalone image for the nCompass Kimi-K2.6 decode MoE.
+#
+# Self-contained: everything the optimized path needs is in this repository. There is no
+# external harness, no bind-mounted wrapper directory and no sitecustomize hook.
+#
+#   docker build -f docker/Dockerfile.ncompass -t vllm-ncompass:latest .
+#
+# Enable at runtime with VLLM_NCOMPASS_KIMI_DECODE_MOE=1. Unset, the image is stock vLLM.
+# The engine validates the rest of the required configuration at startup and refuses to
+# run misconfigured -- see docs/ncompass-kimi-decode-moe.md.
+#
+# Overlay onto the prebuilt wheel rather than rebuilding vLLM from source: the changes are
+# pure Python plus one device-side object, so the vendor .so stay bit-identical.
+FROM vllm/vllm-openai:v0.25.0
+
+ARG VLLM_SITE=/usr/local/lib/python3.12/dist-packages/vllm
+
+# 1) Overlay the edited vLLM package. COPY merges: edited .py overwrite the installed ones.
+#    Preserve the wheel's generated _version.py, and never ship compiled artifacts or
+#    bytecode from the build context -- a stray .so would clobber a vendor kernel and every
+#    check downstream would still pass.
+#
+#    The strip runs over the installed package, which by then holds the wheel's own .so as
+#    well, so snapshot those first and put them back after: unscoped, it deletes all 16 vendor
+#    kernels and the image cannot import vLLM on a GPU host at all. Nothing here catches that
+#    -- the build has no GPU, so platforms/cuda.py is never imported and the missing _C is
+#    only a printed warning -- it surfaces as ModuleNotFoundError at first serve.
+RUN cp "$VLLM_SITE/_version.py" /tmp/_version.py \
+ && (cd "$VLLM_SITE" && find . -name '*.so' -print0 | tar -cf /tmp/vendor_so.tar --null -T -)
+COPY vllm/ ${VLLM_SITE}/
+RUN cp /tmp/_version.py "$VLLM_SITE/_version.py" && rm /tmp/_version.py \
+ && { find "$VLLM_SITE" \( -name '__pycache__' -o -name '*.so' -o -name '*.o' \) \
+      -exec rm -rf {} + 2>/dev/null || true; } \
+ && tar -xf /tmp/vendor_so.tar -C "$VLLM_SITE" && rm /tmp/vendor_so.tar
+
+# 2) Compile the IBGDA device wrapper with THIS image's nvcc, against THIS image's NVSHMEM.
+#    It is nvlinked into every Triton kernel cubin at JIT time, so a mismatched toolkit is a
+#    SASS-level fault rather than a load error. Building it here makes that impossible.
+#    Not a vLLM build step: it never enters _C or any vLLM .so.
+RUN bash ${VLLM_SITE}/model_executor/layers/fused_moe/ncompass_ibgda/build_wrapper.sh \
+ && test -f ${VLLM_SITE}/model_executor/layers/fused_moe/ncompass_ibgda/nvshmem_wrapper.o
+
+# 3) Fail the build, not the first decode step, if the overlay did not take.
+#    The vendor .so are checked by presence, not by import: there is no GPU here, so importing
+#    them is not possible and their absence would otherwise pass as a warning.
+RUN test "$(find ${VLLM_SITE} -name '*.so' | wc -l)" -ge 16 \
+ || { echo "vendor .so missing from ${VLLM_SITE} -- the overlay strip removed wheel kernels"; \
+      exit 1; }
+RUN python3 -c "\
+import vllm, vllm.envs as e; \
+from vllm.model_executor.layers.fused_moe import ncompass_moe_config as c; \
+assert e.VLLM_NCOMPASS_KIMI_DECODE_MOE is False, 'flag must default off'; \
+assert (c.SLOTTED, c.RELAY, c.PUTSIG, c.IBGDA, c.NOAG, c.B2B) == (True,)*6; \
+assert (c.RELAY_WARPS, c.RELAY_BLOCK, c.DISPATCH_WARPS, c.EXPERT_GROUPS) == (32, 8192, 8, 1); \
+print('ncompass overlay OK', vllm.__version__)"
