@@ -561,6 +561,15 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
+        # Launch the multi-stream (aux-stream) shared expert BEFORE the routed path
+        # so it overlaps the routed dispatch/combine comms. This is a no-op for the
+        # async backends that overlap it inside the modular kernel instead. The join
+        # (main waits for aux) is deferred to SharedExperts.output (shared+routed add).
+        self._maybe_apply_shared_experts(
+            shared_experts_input,
+            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+        )
+
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
             fused_out = self.routed_experts.forward_monolithic(
@@ -584,11 +593,6 @@ class MoERunner(MoERunnerInterface):
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
             )
-
-        self._maybe_apply_shared_experts(
-            shared_experts_input,
-            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-        )
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,

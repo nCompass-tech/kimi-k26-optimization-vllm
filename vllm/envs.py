@@ -178,6 +178,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     VLLM_TPU_USING_PATHWAYS: bool = False
+    VLLM_NCOMPASS_KIMI_DECODE_MOE: bool = False
     VLLM_USE_DEEP_GEMM: bool = True
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
@@ -1455,6 +1456,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "proxy" in os.getenv("JAX_PLATFORMS", "").lower()
     ),
     # Allow use of DeepGemm kernels for fused moe ops.
+    # ncompass: enable the optimized Kimi-K2.6 decode MoE path (device-initiated all-to-all
+    # transport, slot-addressed dispatch, fused put+signal, rail relay, shape-derived Marlin
+    # M-tile). Off is byte-identical stock vLLM. On additionally requires the serve args and
+    # container env in docs/ncompass-kimi-decode-moe.md; the engine validates them at startup
+    # and refuses to run misconfigured.
+    "VLLM_NCOMPASS_KIMI_DECODE_MOE": lambda: bool(
+        int(os.getenv("VLLM_NCOMPASS_KIMI_DECODE_MOE", "0"))
+    ),
     "VLLM_USE_DEEP_GEMM": lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM", "1"))),
     # Allow use of DeepGemm specifically for MoE fused ops (overrides only MoE).
     "VLLM_MOE_USE_DEEP_GEMM": lambda: bool(

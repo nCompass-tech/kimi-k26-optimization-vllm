@@ -254,3 +254,6 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# ncompass: IBGDA wrapper object is a build output (arch-specific, built in-image)
+vllm/model_executor/layers/fused_moe/ncompass_ibgda/nvshmem_wrapper.o

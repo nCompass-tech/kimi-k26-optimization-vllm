@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1.7
+#
+# Standalone image for the nCompass Kimi-K2.6 decode MoE.
+#
+# Self-contained: everything the optimized path needs is in this repository. There is no
+# external harness, no bind-mounted wrapper directory and no sitecustomize hook.
+#
+#   docker build -f docker/Dockerfile.ncompass -t vllm-ncompass:latest .
+#
+# Enable at runtime with VLLM_NCOMPASS_KIMI_DECODE_MOE=1. Unset, the image is stock vLLM.
+# The engine validates the rest of the required configuration at startup and refuses to
+# run misconfigured -- see docs/ncompass-kimi-decode-moe.md.
+#
+# Overlay onto the prebuilt wheel rather than rebuilding vLLM from source: the changes are
+# pure Python plus one device-side object, so the vendor .so stay bit-identical.
+FROM vllm/vllm-openai:v0.25.0
+
+ARG VLLM_SITE=/usr/local/lib/python3.12/dist-packages/vllm
+
+# 1) Overlay the edited vLLM package. COPY merges: edited .py overwrite the installed ones.
+#    Preserve the wheel's generated _version.py, and never ship compiled artifacts or
+#    bytecode from the build context -- a stray .so would clobber a vendor kernel and every
+#    check downstream would still pass.
+RUN cp "$VLLM_SITE/_version.py" /tmp/_version.py
+COPY vllm/ ${VLLM_SITE}/
+RUN cp /tmp/_version.py "$VLLM_SITE/_version.py" && rm /tmp/_version.py \
+ && find "$VLLM_SITE" \( -name '__pycache__' -o -name '*.so' -o -name '*.o' \) \
+      -exec rm -rf {} + 2>/dev/null || true
+
+# 2) Compile the IBGDA device wrapper with THIS image's nvcc, against THIS image's NVSHMEM.
+#    It is nvlinked into every Triton kernel cubin at JIT time, so a mismatched toolkit is a
+#    SASS-level fault rather than a load error. Building it here makes that impossible.
+#    Not a vLLM build step: it never enters _C or any vLLM .so.
+RUN bash ${VLLM_SITE}/model_executor/layers/fused_moe/ncompass_ibgda/build_wrapper.sh \
+ && test -f ${VLLM_SITE}/model_executor/layers/fused_moe/ncompass_ibgda/nvshmem_wrapper.o
+
+# 3) Fail the build, not the first decode step, if the overlay did not take.
+RUN python3 -c "\
+import vllm, vllm.envs as e; \
+from vllm.model_executor.layers.fused_moe import ncompass_moe_config as c; \
+assert e.VLLM_NCOMPASS_KIMI_DECODE_MOE is False, 'flag must default off'; \
+assert (c.SLOTTED, c.RELAY, c.PUTSIG, c.IBGDA, c.NOAG, c.B2B) == (True,)*6; \
+assert (c.RELAY_WARPS, c.RELAY_BLOCK, c.DISPATCH_WARPS, c.EXPERT_GROUPS) == (32, 8192, 8, 1); \
+print('ncompass overlay OK', vllm.__version__)"
