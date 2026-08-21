@@ -52,6 +52,9 @@ class SharedExperts(torch.nn.Module):
         # index is always 0 and the second output list element is ignored.
         self.enable_dbo = enable_dbo
         self._output: list[torch.Tensor | None] = [None, None]
+        # Tracks whether each ubatch's output was produced on the aux stream and
+        # therefore still needs a deferred join before it can be consumed.
+        self._output_on_aux: list[bool] = [False, False]
         self._layer = layer
         self._moe_config = moe_config
 
@@ -134,10 +137,11 @@ class SharedExperts(torch.nn.Module):
     ) -> torch.Tensor:
         # TODO: assert that maybe_sync_shared_experts_stream has been called.
 
-        # Run shared experts in parallel on a separate stream.
+        # Run shared experts in parallel on a separate stream. The join
+        # (main stream waits for aux) is deferred to SharedExperts.output so the
+        # routed path issued after this launch overlaps the shared expert.
         with torch.cuda.stream(self._stream):
             output = self._layer(shared_experts_input)
-        current_stream().wait_stream(self._stream)
 
         return output
 
@@ -148,6 +152,12 @@ class SharedExperts(torch.nn.Module):
     @property
     def output(self) -> torch.Tensor:
         assert self._output[self._output_idx] is not None
+        # Deferred join: only now (at consumption) does the main stream wait for
+        # the aux-stream shared expert, so routed work issued after the launch
+        # overlapped it instead of the main stream blocking at launch time.
+        if self._output_on_aux[self._output_idx]:
+            current_stream().wait_stream(self._stream)
+            self._output_on_aux[self._output_idx] = False
         output = self._output[self._output_idx]
         self._output[self._output_idx] = None
         return output
@@ -168,6 +178,7 @@ class SharedExperts(torch.nn.Module):
             self._output[self._output_idx] = self._run_in_aux_stream(
                 shared_experts_input
             )
+            self._output_on_aux[self._output_idx] = True
         else:
             self._output[self._output_idx] = self._layer(shared_experts_input)
 

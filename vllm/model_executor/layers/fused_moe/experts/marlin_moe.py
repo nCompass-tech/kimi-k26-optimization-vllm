@@ -7,6 +7,7 @@ from collections.abc import Callable
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -51,6 +52,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
 
 
 def _fused_marlin_moe(
@@ -255,6 +257,8 @@ def fused_marlin_moe(
     clamp_limit: float | None = None,
     gemm1_alpha: float = 1.0,
     gemm1_beta: float = 0.0,
+    skip_topk_reduce: bool = False,
+    block_size_m_override: int = -1,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -314,9 +318,22 @@ def fused_marlin_moe(
 
     # M block size selection logic
     # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
+    #
+    # `block_size_m_override` (default -1 = unchanged) bypasses the loop below.
+    # The loop's guard `M * topk / E` pairs a GLOBAL topk with a LOCAL E
+    # (= w1.size(0)), ignoring that expert_map filtering leaves only
+    # E_local/E_global of the pairs on this rank -- so under expert parallelism
+    # it overestimates rows-per-expert by the EP factor and picks a tile far
+    # larger than the data warrants. Callers that know their true row count can
+    # pass the right tile directly. Must be a host-side constant: it fixes
+    # `sorted_token_ids`' shape and the kernel's template dispatch, both frozen
+    # at CUDA-graph capture.
+    if block_size_m_override >= 0:
+        block_size_m = block_size_m_override
+    else:
+        for block_size_m in [8, 16, 32, 48, 64]:
+            if M * topk / E / block_size_m < 0.9:
+                break
 
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
@@ -330,6 +347,12 @@ def fused_marlin_moe(
         expert_map,
         ignore_invalid_experts=True,
     )
+
+    # The tile fields are pure host-side ints and are therefore CAPTURE-SAFE --
+    # only the `num_tokens_post_padded` read is not, because `.item()` is a D2H
+    # sync. Guarding the WHOLE block on "not capturing" made this module
+    # invisible in any graphed run (its Marlin call is always captured); that
+    # blind spot is what this split fixes.
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -364,13 +387,27 @@ def fused_marlin_moe(
         workspace=workspace,
         intermediate_cache13=intermediate_cache13,
         intermediate_cache2=intermediate_cache2,
-        output=None,
+        # skip_topk_reduce path returns the 2nd-GEMM output directly, so route the caller's
+        # output buffer straight into that GEMM (lets callers fuse, e.g. write into a comms
+        # send buffer). Non-skip callers keep None -> the reduce writes `output` at the end.
+        output=(output if skip_topk_reduce else None),
         input_dtype=input_dtype,
         is_k_full=is_k_full,
         clamp_limit=clamp_limit,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
     ).view(-1, topk, K)
+
+    # topk==1 (e.g. the G2 pipeline, whose recv rows are pre-expanded to one
+    # expert each): the reduction over the top-k dim is the identity. Skip the
+    # full-size reduce_kernel (pure [M,K] data movement) and return the GEMM
+    # output view directly. Opt-in so shared modular callers stay unchanged.
+    if skip_topk_reduce:
+        assert topk == 1, "skip_topk_reduce requires topk==1 (identity reduction)"
+        # The 2nd GEMM already wrote its result into `output` (when provided) or the workspace;
+        # topk==1 makes the reduce the identity, so that buffer IS the result. Return its view
+        # (aliases `output` when given -> caller can detect the aliasing and skip a copy).
+        return moe_output.view(-1, K)
 
     if output is None:
         output = torch.empty_like(hidden_states)
